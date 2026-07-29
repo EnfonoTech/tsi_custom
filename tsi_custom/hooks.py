@@ -1,6 +1,6 @@
 app_name = "tsi_custom"
-app_title = "Traffic Service International LLC"
-app_publisher = "Enfono "
+app_title = "TSI"
+app_publisher = "Enfono"
 app_description = "Custom ERPNext App for Traffic Service International LLC"
 app_email = "neha@enfono.com"
 app_license = "mit"
@@ -15,7 +15,7 @@ app_license = "mit"
 # 	{
 # 		"name": "tsi_custom",
 # 		"logo": "/assets/tsi_custom/logo.png",
-# 		"title": "Traffic Service International LLC",
+# 		"title": "TSI",
 # 		"route": "/tsi_custom",
 # 		"has_permission": "tsi_custom.api.permission.has_app_permission"
 # 	}

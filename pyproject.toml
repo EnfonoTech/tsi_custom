@@ -1,7 +1,7 @@
 [project]
 name = "tsi_custom"
 authors = [
-    { name = "Enfono ", email = "neha@enfono.com"}
+    { name = "Enfono", email = "neha@enfono.com"}
 ]
 description = "Custom ERPNext App for Traffic Service International LLC"
 requires-python = ">=3.10"
