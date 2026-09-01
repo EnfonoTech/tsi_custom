@@ -1,145 +1,187 @@
 // apps/tsi_custom/tsi_custom/public/js/salary_structure_assignment.js
 //
-// Salary component allocation on Salary Structure Assignment.
+// Component allocation on Salary Structure Assignment.
 //
-// A clock button (history) and a pencil button (change) are injected beside each
-// allocatable component field. The pencil does NOT edit this assignment -- it
-// creates the next one, dated from the effective date, so payroll for earlier
-// periods keeps reproducing its original figures.
-
-frappe.provide("tsi_custom.salary_allocation");
+// Selecting a Salary Structure fills the allocation grid with that structure's
+// components. On a submitted assignment, "Change Allocation" does not edit this
+// record -- it creates the next one, dated from the effective date, so payroll
+// for earlier periods keeps reproducing its original figures.
 
 const API = "tsi_custom.salary_allocation";
-const BTN_CLASS = "tsi-alloc-btns";
+const TABLE = "custom_tsi_allocations";
 
 frappe.ui.form.on("Salary Structure Assignment", {
 	refresh(frm) {
-		if (frm.is_new()) return;
-		load_allocation_fields().then((fields) => inject_buttons(frm, fields));
+		if (frm.is_new() || frm.doc.docstatus !== 1) return;
+
+		frm.add_custom_button(__("Change Allocation"), () => show_change_dialog(frm));
+		frm.add_custom_button(__("Allocation History"), () => show_history_dialog(frm));
 	},
 
-	after_save(frm) {
-		load_allocation_fields().then((fields) => inject_buttons(frm, fields));
+	salary_structure(frm) {
+		if (!frm.doc.salary_structure) {
+			frm.clear_table(TABLE);
+			frm.refresh_field(TABLE);
+			return;
+		}
+		fill_from_structure(frm);
 	},
 });
 
-// The server owns the component list, so a site whose Custom Fields have not
-// been migrated yet renders whatever exists instead of erroring.
-function load_allocation_fields() {
-	if (tsi_custom.salary_allocation._fields) {
-		return Promise.resolve(tsi_custom.salary_allocation._fields);
+// -- Fill the grid from the structure -----------------------------------------
+
+function fill_from_structure(frm) {
+	frappe
+		.xcall(`${API}.get_structure_components`, { salary_structure: frm.doc.salary_structure })
+		.then((components) => {
+			if (!components) return;
+
+			// Keep amounts already entered for components the new structure also has.
+			const kept = {};
+			(frm.doc[TABLE] || []).forEach((row) => {
+				kept[row.salary_component] = row.amount;
+			});
+
+			frm.clear_table(TABLE);
+			components.forEach((component) => {
+				const row = frm.add_child(TABLE, component);
+				row.amount = kept[component.salary_component] || 0;
+			});
+			frm.refresh_field(TABLE);
+
+			const dropped = Object.keys(kept).filter(
+				(name) => !components.some((c) => c.salary_component === name)
+			);
+			if (dropped.length) {
+				frappe.show_alert(
+					{
+						message: __("Removed components not in this structure: {0}", [dropped.join(", ")]),
+						indicator: "orange",
+					},
+					7
+				);
+			}
+		});
+}
+
+// -- Change allocation --------------------------------------------------------
+
+function show_change_dialog(frm) {
+	const rows = frm.doc[TABLE] || [];
+	if (!rows.length) {
+		frappe.msgprint(__("This assignment has no allocated components."));
+		return;
 	}
-	return frappe
-		.xcall(`${API}.get_allocation_fields`)
-		.then((fields) => {
-			tsi_custom.salary_allocation._fields = fields || [];
-			return tsi_custom.salary_allocation._fields;
-		})
-		.catch(() => []);
-}
 
-function inject_buttons(frm, fields) {
-	(fields || []).forEach((field) => inject_for_field(frm, field));
-}
-
-function inject_for_field(frm, field) {
-	const control = frm.fields_dict[field.fieldname];
-	if (!control || !control.$wrapper) return;
-	if (control.$wrapper.find(`.${BTN_CLASS}`).length) return; // already injected
-
-	const $label = control.$wrapper.find(".control-label").first();
-	if (!$label.length) return;
-
-	const $btns = $(`
-		<span class="${BTN_CLASS}" style="float:right;display:inline-flex;gap:3px;margin-top:1px;">
-			<button class="btn btn-xs btn-default tsi-alloc-history"
-				title="${frappe.utils.escape_html(__("History of {0}", [field.label]))}"
-				style="padding:2px 6px;line-height:1.2;">${icon_clock()}</button>
-			<button class="btn btn-xs btn-primary tsi-alloc-change"
-				title="${frappe.utils.escape_html(__("Change {0} from a date", [field.label]))}"
-				style="padding:2px 6px;line-height:1.2;">${icon_pencil()}</button>
-		</span>
-	`);
-
-	$label.append($btns);
-	$btns.find(".tsi-alloc-history").on("click", (e) => {
-		e.stopPropagation();
-		show_history_dialog(frm, field);
-	});
-	$btns.find(".tsi-alloc-change").on("click", (e) => {
-		e.stopPropagation();
-		show_change_dialog(frm, field);
-	});
-}
-
-// -- Change dialog ------------------------------------------------------------
-
-function show_change_dialog(frm, field) {
-	const current = flt(frm.doc[field.fieldname]);
+	// The Table control reads and writes this array in place, so it has to be a
+	// stable reference held outside the dialog -- returning dialog.get_value()
+	// from get_data would be circular. Same shape erpnext uses for its own
+	// "Update Items" dialog (erpnext/public/js/utils.js).
+	const allocations = rows.map((row) => ({
+		salary_component: row.salary_component,
+		component_type: row.component_type,
+		current_amount: flt(row.amount),
+		new_amount: flt(row.amount),
+	}));
 
 	const dialog = new frappe.ui.Dialog({
-		title: __("Change {0}", [field.label]),
+		title: __("Change Allocation"),
+		size: "extra-large",
 		fields: [
-			{
-				fieldname: "component",
-				fieldtype: "Data",
-				label: __("Component"),
-				default: field.label,
-				read_only: 1,
-			},
-			{ fieldtype: "Column Break" },
 			{
 				fieldname: "effective_from",
 				fieldtype: "Date",
 				label: __("Effective From"),
 				reqd: 1,
-				default: frappe.datetime.month_start(frappe.datetime.add_months(frappe.datetime.get_today(), 1)),
+				// month_start() takes no argument -- it always means the current
+				// month -- so shift it with add_months, which does read its date.
+				default: frappe.datetime.add_months(frappe.datetime.month_start(), 1),
 				description: __(
 					"A new Salary Structure Assignment is created from this date. Payroll for periods starting before it is unaffected."
 				),
 			},
 			{ fieldtype: "Section Break" },
 			{
-				fieldname: "current_value",
-				fieldtype: "Currency",
-				label: __("Current Value"),
-				default: current,
-				read_only: 1,
-			},
-			{ fieldtype: "Column Break" },
-			{
-				fieldname: "new_value",
-				fieldtype: "Currency",
-				label: __("New Value"),
-				reqd: 1,
-				default: current,
+				fieldname: "allocations",
+				fieldtype: "Table",
+				label: __("Components"),
+				cannot_add_rows: true,
+				cannot_delete_rows: true,
+				in_place_edit: false,
+				data: allocations,
+				get_data: () => allocations,
+				// grid.js starts total_colsize at 1 and drops any column that
+				// pushes it past 11, so these must sum to 10 or less -- at 11 the
+				// editable "New" column disappears without a word.
+				fields: [
+					{
+						fieldname: "salary_component",
+						fieldtype: "Data",
+						label: __("Component"),
+						in_list_view: 1,
+						read_only: 1,
+						columns: 3,
+					},
+					{
+						fieldname: "component_type",
+						fieldtype: "Data",
+						label: __("Type"),
+						in_list_view: 1,
+						read_only: 1,
+						columns: 2,
+					},
+					{
+						fieldname: "current_amount",
+						fieldtype: "Currency",
+						label: __("Current"),
+						in_list_view: 1,
+						read_only: 1,
+						columns: 2,
+					},
+					{
+						fieldname: "new_amount",
+						fieldtype: "Currency",
+						label: __("New"),
+						in_list_view: 1,
+						columns: 3,
+					},
+				],
 			},
 			{ fieldtype: "Section Break" },
 			{ fieldname: "notes", fieldtype: "Small Text", label: __("Notes (optional)") },
 		],
 		primary_action_label: __("Create Assignment"),
 		primary_action(values) {
-			dialog.disable_primary_action();
+			const changes = {};
+			allocations.forEach((row) => {
+				if (flt(row.new_amount) !== flt(row.current_amount)) {
+					changes[row.salary_component] = flt(row.new_amount);
+				}
+			});
 
+			if (!Object.keys(changes).length) {
+				frappe.msgprint(__("No amounts were changed."));
+				return;
+			}
+
+			dialog.disable_primary_action();
 			frappe
-				.xcall(`${API}.change_component_values`, {
+				.xcall(`${API}.change_allocations`, {
 					employee: frm.doc.employee,
 					effective_from: values.effective_from,
-					changes: { [field.fieldname]: values.new_value },
+					changes: changes,
 					notes: values.notes || null,
 					// So the server can refuse if this is not the assignment
-					// actually in force -- the Current Value shown below came
-					// from this record.
+					// actually in force -- the Current amounts came from here.
 					source_assignment: frm.doc.name,
 				})
 				.then((result) => {
 					dialog.hide();
 					frappe.show_alert(
 						{
-							message: __("{0} effective {1} on assignment {2}", [
-								field.label,
-								frappe.format(values.effective_from, { fieldtype: "Date" }),
+							message: __("Assignment {0} created, effective {1}", [
 								result.name,
+								frappe.format(values.effective_from, { fieldtype: "Date" }),
 							]),
 							indicator: "green",
 						},
@@ -154,32 +196,58 @@ function show_change_dialog(frm, field) {
 	dialog.show();
 }
 
-// -- History dialog -----------------------------------------------------------
+// -- History ------------------------------------------------------------------
 
-function show_history_dialog(frm, field) {
-	const dialog = new frappe.ui.Dialog({
-		title: __("History — {0}", [field.label]),
-		size: "large",
-	});
-
-	const $body = $('<div class="tsi-alloc-history-body"></div>').appendTo(dialog.$body);
-	$body.html(`<div class="text-muted">${__("Loading…")}</div>`);
-	dialog.show();
-
-	frappe
-		.xcall(`${API}.get_component_history`, {
-			employee: frm.doc.employee,
-			fieldname: field.fieldname,
-		})
-		.then((rows) => render_history($body, rows || [], frm.doc.name))
-		.catch(() => $body.html(`<div class="text-danger">${__("Could not load history.")}</div>`));
-}
-
-function render_history($body, rows, current_name) {
+function show_history_dialog(frm) {
+	const rows = frm.doc[TABLE] || [];
 	if (!rows.length) {
-		$body.html(`<div class="text-muted text-center" style="padding:20px;">${__("No assignments found.")}</div>`);
+		frappe.msgprint(__("This assignment has no allocated components."));
 		return;
 	}
+
+	const dialog = new frappe.ui.Dialog({
+		title: __("Allocation History"),
+		size: "large",
+		fields: [
+			{
+				fieldname: "salary_component",
+				fieldtype: "Select",
+				label: __("Component"),
+				options: rows.map((row) => row.salary_component).join("\n"),
+				default: rows[0].salary_component,
+				onchange: () => load(dialog.get_value("salary_component")),
+			},
+			{ fieldtype: "Section Break" },
+			{ fieldname: "history", fieldtype: "HTML" },
+		],
+	});
+
+	function load(component) {
+		const $area = dialog.get_field("history").$wrapper;
+		$area.html(`<div class="text-muted">${__("Loading…")}</div>`);
+
+		frappe
+			.xcall(`${API}.get_component_history`, {
+				employee: frm.doc.employee,
+				salary_component: component,
+			})
+			.then((history) => render_history($area, history || [], frm.doc.name))
+			.catch(() => $area.html(`<div class="text-danger">${__("Could not load history.")}</div>`));
+	}
+
+	dialog.show();
+	load(rows[0].salary_component);
+}
+
+function render_history($area, rows, current_name) {
+	if (!rows.length) {
+		$area.html(`<div class="text-muted text-center" style="padding:20px;">${__("No assignments found.")}</div>`);
+		return;
+	}
+
+	// Only submitted assignments are visible to payroll, so a delta is only
+	// meaningful between two of them.
+	const submitted = rows.filter((row) => row.docstatus === 1);
 
 	const header = [
 		__("Effective From"),
@@ -190,17 +258,10 @@ function render_history($body, rows, current_name) {
 		__("Status"),
 	];
 
-	// Only submitted assignments are visible to payroll, so a delta is only
-	// meaningful between two of them -- a draft in between must not be treated
-	// as the previous value.
-	const submitted = rows.filter((row) => row.docstatus === 1);
-
-	const body_rows = rows.map((row) => {
+	const body = rows.map((row) => {
 		let delta = null;
 		if (row.docstatus === 1) {
-			// rows are newest-first, so the next submitted entry is the previous one.
-			const position = submitted.indexOf(row);
-			const previous = submitted[position + 1];
+			const previous = submitted[submitted.indexOf(row) + 1];
 			if (previous) delta = flt(row.value) - flt(previous.value);
 		}
 
@@ -221,11 +282,11 @@ function render_history($body, rows, current_name) {
 			</tr>`;
 	});
 
-	$body.html(`
+	$area.html(`
 		<div style="overflow-x:auto;">
 			<table class="table table-bordered table-sm" style="font-size:12px;margin:0;">
 				<thead><tr>${header.map((h) => `<th>${h}</th>`).join("")}</tr></thead>
-				<tbody>${body_rows.join("")}</tbody>
+				<tbody>${body.join("")}</tbody>
 			</table>
 		</div>
 		<div class="text-muted" style="font-size:11px;margin-top:8px;">
@@ -243,32 +304,16 @@ function format_delta(delta) {
 }
 
 function assignment_link(name, current_name) {
-	const label = frappe.utils.escape_html(name);
 	const href = `/app/salary-structure-assignment/${encodeURIComponent(name)}`;
 	const marker = name === current_name ? ` <span class="text-muted">(${__("this one")})</span>` : "";
-	return `<a href="${href}">${label}</a>${marker}`;
+	return `<a href="${href}">${frappe.utils.escape_html(name)}</a>${marker}`;
 }
 
 function status_badge(row) {
-	if (row.docstatus === 0) {
-		return `<span class="indicator-pill red">${__("Draft")}</span>`;
-	}
+	if (row.docstatus === 0) return `<span class="indicator-pill red">${__("Draft")}</span>`;
+	// Submitted but not yet in force -- payroll is still using an earlier one.
+	if (row.is_scheduled) return `<span class="indicator-pill blue">${__("Scheduled")}</span>`;
 	return row.is_current
 		? `<span class="indicator-pill green">${__("Current")}</span>`
 		: `<span class="indicator-pill gray">${__("Superseded")}</span>`;
-}
-
-// -- Icons --------------------------------------------------------------------
-
-function icon_clock() {
-	return `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-		stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-		<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>`;
-}
-
-function icon_pencil() {
-	return `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-		stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-		<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-		<path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>`;
 }
