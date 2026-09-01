@@ -8,7 +8,8 @@ app_license = "mit"
 # Apps
 # ------------------
 
-# required_apps = []
+# Salary allocation extends hrms' Salary Structure Assignment / Salary Slip.
+required_apps = ["frappe/erpnext", "frappe/hrms"]
 
 # Each item in the list will be shown as an app in the apps page
 # add_to_apps_screen = [
@@ -43,7 +44,10 @@ app_license = "mit"
 # page_js = {"page" : "public/js/file.js"}
 
 # include js in doctype views
-# doctype_js = {"doctype" : "public/js/doctype.js"}
+doctype_js = {
+	"Salary Structure Assignment": "public/js/salary_structure_assignment.js",
+}
+
 doctype_list_js = {
 	"Payroll Entry": "public/js/zip_export_list.js",
 	"Salary Slip": "public/js/zip_export_list.js",
@@ -141,13 +145,13 @@ doctype_list_js = {
 # ---------------
 # Hook on document methods and events
 
-# doc_events = {
-# 	"*": {
-# 		"on_update": "method",
-# 		"on_cancel": "method",
-# 		"on_trash": "method"
-# 	}
-# }
+doc_events = {
+	"Salary Structure Assignment": {
+		# Keeps the read-only Total Salary in step with the components it sums,
+		# including on assignments created by hand rather than by this app.
+		"validate": "tsi_custom.salary_allocation.set_total_salary",
+	},
+}
 
 # Scheduled Tasks
 # ---------------
@@ -251,3 +255,12 @@ doctype_list_js = {
 # List of apps whose translatable strings should be excluded from this app's translations.
 # ignore_translatable_strings_from = []
 
+# Fixtures
+# --------
+# The Salary Allocation Custom Fields on Salary Structure Assignment. Without
+# these the allocation API validates against missing fields and refuses to run,
+# so they must ship with the app rather than be created per site.
+fixtures = [
+	{"doctype": "Custom Field", "filters": [["module", "=", "TSI"]]},
+	{"doctype": "Property Setter", "filters": [["module", "=", "TSI"]]},
+]
