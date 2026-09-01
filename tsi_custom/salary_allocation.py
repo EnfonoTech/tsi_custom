@@ -1,199 +1,367 @@
 # apps/tsi_custom/tsi_custom/salary_allocation.py
-"""Effective-dated salary component allocation on Salary Structure Assignment.
+"""Per-component salary allocation on Salary Structure Assignment.
 
-Design
-------
-Each component amount lives in its own Currency field on the Salary Structure
-Assignment (SSA). Changing one does **not** rewrite the submitted assignment --
-it creates a **new submitted SSA** dated from the effective date, carrying every
-other value forward unchanged.
+Selecting a Salary Structure on an assignment fills a grid with every component
+that structure defines. Each row carries the amount allocated to that employee
+for that component.
 
-Why this shape, and not an override ledger that rewrites the SSA in place:
+How payroll reads it
+--------------------
+A Salary Detail row only picks up a value if it is formula-based and its formula
+names a variable in the evaluation namespace. That namespace is built by
+``hrms/payroll/doctype/salary_slip/salary_slip.py::get_data_for_eval``, which
+does ``data.update(self._salary_structure_assignment)`` -- and that attribute is
+a **flat row**, fetched with ``frappe.db.get_value(..., "*")`` at
+``salary_slip.py:803``. Child rows are therefore invisible to formulas.
 
-* hrms selects the assignment for a Salary Slip with
-  ``from_date <= <slip start date> ORDER BY from_date DESC`` and merges every
-  field of that row into the formula namespace
-  (``hrms/payroll/doctype/salary_slip/salary_slip.py`` ::
-  ``set_salary_structure_assignment`` and ``get_data_for_eval``). One assignment
-  per effective date therefore gives date-correct payroll for free.
-* A slip regenerated for an earlier period still reproduces its original
-  figures. Rewriting amounts on a single assignment does the opposite: it
-  retroactively repays history.
-* Nothing writes to a submitted document, so ``docstatus``, Versions and
-  permissions remain the real audit trail -- no scheduler, no
-  ``frappe.db.set_value`` into a submitted SSA, no Pending/Applied state machine
-  that can silently drift out of sync with what payroll actually reads.
+So each allocation row publishes a variable named ``alloc_<ABBR>``, injected by
+:class:`~tsi_custom.overrides.salary_slip.TSISalarySlip`, which extends
+``get_data_for_eval`` and nothing else. :func:`wire_salary_structure_formulas`
+points each Salary Structure row at its own variable.
 
-Core only blocks a duplicate assignment on the *same* ``(employee, from_date)``
-pair, so a chain of dated assignments is a supported, first-class pattern.
-
-Payroll read path
------------------
-The Salary Structure's earning rows must reference these fieldnames in their
-``formula``. :func:`wire_salary_structure_formulas` does that wiring; see the
-"Salary allocation" section of the app README for the runbook.
+Effective dating
+----------------
+Changing an amount does **not** rewrite the submitted assignment. It creates the
+next one, dated from the effective date, carrying everything else forward. hrms
+picks the assignment for a slip with ``from_date <= <slip start> ORDER BY
+from_date DESC``, so a slip reads the amounts in force for its own period and a
+regenerated old slip reproduces its original figures.
 """
+
+import re
 
 import frappe
 from frappe import _
 from frappe.utils import add_days, cstr, flt, getdate
 
-#: SSA fields treated as allocatable salary components, in display order.
-#: ``base`` is core; the rest ship as Custom Fields in this app's fixtures.
-ALLOCATION_FIELDS = (
-	"base",
-	"custom_tsi_hra_amount",
-	"custom_tsi_transport_amount",
-	"custom_tsi_other_allowance_amount",
-)
+#: Table field added to Salary Structure Assignment by this app's fixtures.
+ALLOCATION_FIELD = "custom_tsi_allocations"
 
-#: Read-only field holding the sum of :data:`ALLOCATION_FIELDS`. It is the
-#: contracted monthly allocation, NOT the paid gross -- a Salary Slip prorates
-#: and rounds each component independently, so the two legitimately differ.
+#: Read-only field holding the sum of the Earning rows. The contracted monthly
+#: allocation, NOT the paid gross -- a slip prorates and rounds each component
+#: independently, so the two legitimately differ.
 TOTAL_FIELD = "custom_tsi_total_salary"
 
-#: Fieldtypes a component may use. Guards the client-supplied fieldname.
-_NUMERIC_FIELDTYPES = ("Currency", "Float", "Int", "Percent")
+#: Salary Detail flags marking a row this feature must not touch. An income-tax
+#: row (``variable_based_on_taxable_salary``) is computed by hrms from the tax
+#: slab -- giving it a formula stops it being treated as tax at all. A flexible
+#: benefit is driven by its own claim/max-benefit logic, and a statistical
+#: component is an intermediate that other formulas read.
+UNMANAGED_FLAGS = ("variable_based_on_taxable_salary", "is_flexible_benefit", "statistical_component")
 
-#: Mid-year income-tax opening balances. They belong to the assignment that
-#: opened the employee's payroll period, never to a later one carried forward --
-#: hrms' get_opening_for() only ignores them while
-#: ``from_date < payroll_period.start_date``, so an assignment dated inside the
-#: current period would re-arm a stale opening for every remaining slip.
-_TAX_OPENING_FIELDS = ("taxable_earnings_till_date", "tax_deducted_till_date")
-
-#: Default Salary Component -> SSA fieldname wiring for
-#: :func:`wire_salary_structure_formulas`. Override per site by passing
-#: ``mapping``; these are the labels TSI's structure is expected to use.
-DEFAULT_COMPONENT_MAP = {
-	"Basic": "base",
-	"HRA": "custom_tsi_hra_amount",
-	"Transport Allowance": "custom_tsi_transport_amount",
-	"Other Allowance": "custom_tsi_other_allowance_amount",
-}
+#: Prefix for the formula variable each row publishes. Keeps these names clear
+#: of a component's own abbreviation, which core already seeds into the same
+#: namespace via get_component_abbr_map().
+VARIABLE_PREFIX = "alloc_"
 
 
-# -- Metadata -----------------------------------------------------------------
+# -- Formula variables --------------------------------------------------------
+
+
+def formula_variable(abbr: str, salary_component: str | None = None) -> str:
+	"""Build the eval-namespace name a component's amount is published under.
+
+	An abbreviation is free text, so it is reduced to a Python identifier before
+	it can be used in a formula.
+	"""
+	token = re.sub(r"\W+", "_", cstr(abbr) or cstr(salary_component)).strip("_")
+	if not token:
+		token = "unnamed"
+	if token[0].isdigit():
+		token = f"c{token}"
+	return f"{VARIABLE_PREFIX}{token}"
+
+
+# -- Reading the structure ----------------------------------------------------
 
 
 @frappe.whitelist()
-def get_allocation_fields() -> list[dict]:
-	"""Return the allocatable component fields that actually exist on the SSA.
+def get_structure_components(salary_structure: str) -> list[dict]:
+	"""Every component a Salary Structure defines, earnings first.
 
-	The client renders its buttons from this list, so a site that has not yet
-	migrated the Custom Fields degrades to whatever is present instead of
-	throwing.
+	Drives the grid on the assignment form.
 	"""
-	frappe.has_permission("Salary Structure Assignment", "read", throw=True)
-
-	meta = frappe.get_meta("Salary Structure Assignment")
-	fields = []
-	for fieldname in ALLOCATION_FIELDS:
-		field = meta.get_field(fieldname)
-		if field and field.fieldtype in _NUMERIC_FIELDTYPES:
-			fields.append({"fieldname": fieldname, "label": _(field.label or fieldname)})
-	return fields
+	frappe.has_permission("Salary Structure", "read", throw=True)
+	return _structure_components(salary_structure)
 
 
-def _validate_allocation_field(fieldname: str):
-	"""Resolve a client-supplied fieldname to its DocField, or throw.
+def _structure_components(salary_structure: str) -> list[dict]:
+	"""Same, without the permission check.
 
-	The fieldname reaches the database as a column name, so it is validated
-	against the DocType meta rather than trusted.
+	Kept separate so ``validate`` on an assignment does not fail for a user (or a
+	background job) that may create assignments without holding read on Salary
+	Structure -- the link is already on the document by then.
 	"""
-	fieldname = cstr(fieldname).strip()
-	if fieldname not in ALLOCATION_FIELDS:
-		frappe.throw(
-			_("{0} is not an allocatable salary component.").format(frappe.bold(fieldname)),
-			title=_("Unknown Component"),
+	rows = frappe.get_all(
+		"Salary Detail",
+		filters={"parent": salary_structure, "parenttype": "Salary Structure"},
+		fields=["salary_component", "abbr", "parentfield", "idx", *UNMANAGED_FLAGS],
+		order_by="parentfield desc, idx asc",
+	)
+
+	components, seen = [], {}
+	for row in rows:
+		if _is_unmanaged(row):
+			continue
+
+		component_type = "Earning" if row.parentfield == "earnings" else "Deduction"
+		if row.salary_component in seen:
+			if seen[row.salary_component] != component_type:
+				# One component, one allocated amount, one variable -- the model
+				# cannot say "1,000 as an earning and 300 as a deduction".
+				frappe.throw(
+					_(
+						"{0} is listed as both an earning and a deduction in Salary Structure {1}. "
+						"Allocation cannot give it two different amounts -- use separate components."
+					).format(frappe.bold(row.salary_component), frappe.bold(salary_structure)),
+					title=_("Component on Both Sides"),
+				)
+			continue
+
+		seen[row.salary_component] = component_type
+		abbr = _resolve_abbr(row)
+		components.append(
+			{
+				"salary_component": row.salary_component,
+				"abbr": abbr,
+				"component_type": component_type,
+				"formula_variable": formula_variable(abbr, row.salary_component),
+			}
+		)
+	return components
+
+
+def _is_unmanaged(row) -> bool:
+	"""True for a row hrms computes itself -- see :data:`UNMANAGED_FLAGS`."""
+	return any(row.get(flag) for flag in UNMANAGED_FLAGS)
+
+
+def _resolve_abbr(row) -> str:
+	"""A Salary Detail row's abbr, falling back to the component master.
+
+	Shared by the grid and the wiring helper so the two can never disagree on
+	the variable name -- a row with a blank abbr would otherwise be wired to a
+	variable nobody publishes.
+	"""
+	return row.abbr or frappe.get_cached_value(
+		"Salary Component", row.salary_component, "salary_component_abbr"
+	)
+
+
+# -- Document events ----------------------------------------------------------
+
+
+def sync_allocations(doc, method=None) -> None:
+	"""Keep the allocation grid in step with the selected Salary Structure.
+
+	Additive on purpose: rows the structure defines are added if missing and
+	their derived fields refreshed, but a row the structure no longer has is
+	left in place rather than silently dropped with its amount. Extras are
+	reported instead, so the operator decides.
+
+	Registered on Salary Structure Assignment ``validate``.
+	"""
+	if not doc.meta.has_field(ALLOCATION_FIELD):
+		return
+
+	# validate runs before core checks mandatory fields, so a half-filled grid
+	# row can still be present here. Drop it and let core report it.
+	rows = [row for row in doc.get(ALLOCATION_FIELD) or [] if row.salary_component]
+	if len(rows) != len(doc.get(ALLOCATION_FIELD) or []):
+		doc.set(ALLOCATION_FIELD, rows)
+
+	existing = {row.salary_component: row for row in rows}
+	_reject_duplicate_components(existing, rows)
+
+	defined = _structure_components(doc.salary_structure) if doc.salary_structure else []
+	defined_names = {component["salary_component"] for component in defined}
+
+	for component in defined:
+		row = existing.get(component["salary_component"])
+		if not row:
+			row = doc.append(ALLOCATION_FIELD, {"salary_component": component["salary_component"]})
+		row.abbr = component["abbr"]
+		row.component_type = component["component_type"]
+		row.formula_variable = component["formula_variable"]
+
+	_reject_variable_collisions(doc.get(ALLOCATION_FIELD) or [])
+
+	extras = [
+		row.salary_component
+		for row in doc.get(ALLOCATION_FIELD) or []
+		if row.salary_component not in defined_names
+	]
+	if extras:
+		frappe.msgprint(
+			_(
+				"These rows are not part of {0} and will not reach payroll: {1}. "
+				"Remove them, or add the components to the structure."
+			).format(frappe.bold(doc.salary_structure), frappe.bold(", ".join(cstr(c) for c in extras))),
+			title=_("Components Not in the Structure"),
+			indicator="orange",
 		)
 
-	field = frappe.get_meta("Salary Structure Assignment").get_field(fieldname)
-	if not field or field.fieldtype not in _NUMERIC_FIELDTYPES:
+	_order_allocations(doc)
+
+
+def _reject_duplicate_components(existing: dict, rows: list) -> None:
+	if len(existing) != len(rows):
+		seen, duplicates = set(), set()
+		for row in rows:
+			if row.salary_component in seen:
+				duplicates.add(row.salary_component)
+			seen.add(row.salary_component)
+		frappe.throw(
+			_("{0} appears more than once in the allocation. Each component may be listed only once.").format(
+				frappe.bold(", ".join(sorted(cstr(c) for c in duplicates)))
+			),
+			title=_("Duplicate Component"),
+		)
+
+
+def _reject_variable_collisions(rows: list) -> None:
+	"""Two components whose abbreviations reduce to the same identifier would
+	overwrite each other in the formula namespace, silently."""
+	by_variable = {}
+	for row in rows:
+		# An extra row the structure does not define has no variable. Those are
+		# reported by sync_allocations, not rejected -- do not let two of them
+		# collide on the empty string and hard-block the save.
+		if not row.formula_variable:
+			continue
+		by_variable.setdefault(row.formula_variable, []).append(row.salary_component)
+
+	clashes = {variable: names for variable, names in by_variable.items() if len(names) > 1}
+	if clashes:
+		detail = "; ".join(f"{variable}: {', '.join(names)}" for variable, names in clashes.items())
 		frappe.throw(
 			_(
-				"{0} is missing from Salary Structure Assignment. "
-				"Run bench migrate to sync this app's Custom Fields."
-			).format(frappe.bold(fieldname)),
-			title=_("Component Field Missing"),
+				"These components produce the same formula variable, so their amounts would "
+				"overwrite each other: {0}. Give them distinct abbreviations."
+			).format(frappe.bold(detail)),
+			title=_("Clashing Component Abbreviations"),
 		)
-	return field
 
 
-# -- History ------------------------------------------------------------------
+def _order_allocations(doc) -> None:
+	"""Earnings first, then deductions, each alphabetical -- so the grid reads
+	the same on every assignment."""
+	rows = sorted(
+		doc.get(ALLOCATION_FIELD) or [],
+		key=lambda row: (row.component_type != "Earning", cstr(row.salary_component)),
+	)
+	for index, row in enumerate(rows, start=1):
+		row.idx = index
+	doc.set(ALLOCATION_FIELD, rows)
+
+
+def set_total_salary(doc, method=None) -> None:
+	"""Sum the Earning rows into the read-only total.
+
+	Registered on Salary Structure Assignment ``validate``, after
+	:func:`sync_allocations`.
+	"""
+	if not doc.meta.has_field(TOTAL_FIELD):
+		return
+
+	doc.set(
+		TOTAL_FIELD,
+		sum(flt(row.amount) for row in doc.get(ALLOCATION_FIELD) or [] if row.component_type == "Earning"),
+	)
+
+
+# -- Reading an assignment's allocations --------------------------------------
+
+
+def get_allocations(assignment: str) -> list[dict]:
+	"""Allocation rows for one assignment. Used by the Salary Slip override."""
+	return frappe.get_all(
+		"TSI Salary Allocation",
+		filters={"parent": assignment, "parenttype": "Salary Structure Assignment"},
+		fields=["salary_component", "abbr", "component_type", "formula_variable", "amount"],
+		order_by="idx asc",
+	)
 
 
 @frappe.whitelist()
-def get_component_history(employee: str, fieldname: str) -> list[dict]:
-	"""Return one component's value across the employee's assignment chain.
+def get_component_history(employee: str, salary_component: str) -> list[dict]:
+	"""One component's allocated amount across the employee's assignment chain.
 
-	Newest first. ``effective_until`` is derived from the next assignment's
-	``from_date``; the newest submitted row is open-ended and flagged
-	``is_current``.
+	Newest first. ``effective_until`` comes from the next submitted assignment;
+	the newest submitted row is open-ended and flagged ``is_current``.
 	"""
-	field = _validate_allocation_field(fieldname)
-
 	# get_list (not get_all) so record-level permissions apply to salary data.
-	rows = frappe.get_list(
+	assignments = frappe.get_list(
 		"Salary Structure Assignment",
 		filters={"employee": employee, "docstatus": ["<", 2]},
-		fields=[
-			"name",
-			"from_date",
-			"docstatus",
-			"salary_structure",
-			"owner",
-			"modified",
-			field.fieldname,
-		],
+		fields=["name", "from_date", "docstatus", "salary_structure", "owner", "modified"],
 		order_by="from_date desc, creation desc",
 		limit_page_length=0,
 	)
+	if not assignments:
+		return []
+
+	amounts = {
+		row.parent: flt(row.amount)
+		for row in frappe.get_all(
+			"TSI Salary Allocation",
+			filters={
+				"parent": ["in", [a["name"] for a in assignments]],
+				"parenttype": "Salary Structure Assignment",
+				"salary_component": salary_component,
+			},
+			fields=["parent", "amount"],
+		)
+	}
 
 	# Only submitted assignments are visible to payroll, so only they close a
-	# window. A draft sitting between two submitted rows must not appear to end
-	# the earlier one's period.
-	submitted_from_dates = [row["from_date"] for row in rows if row["docstatus"] == 1]
+	# window. A draft between two submitted rows must not appear to end the
+	# earlier one's period.
+	submitted_dates = [a["from_date"] for a in assignments if a["docstatus"] == 1]
 
-	submitted_seen = False
-	for row in rows:
-		row["value"] = flt(row.pop(field.fieldname, 0))
+	today = getdate()
 
-		if row["docstatus"] == 1:
-			row["is_current"] = not submitted_seen
-			submitted_seen = True
+	current_seen = False
+	for assignment in assignments:
+		assignment["value"] = amounts.get(assignment["name"], 0.0)
+
+		if assignment["docstatus"] == 1:
+			# A future-dated assignment is real but not yet in force -- badging it
+			# Current would point at the wrong figure for this month's payroll.
+			assignment["is_scheduled"] = getdate(assignment["from_date"]) > today
+			assignment["is_current"] = not assignment["is_scheduled"] and not current_seen
+			if assignment["is_current"]:
+				current_seen = True
 			successor = next(
-				(from_date for from_date in reversed(submitted_from_dates) if from_date > row["from_date"]),
+				(date for date in reversed(submitted_dates) if date > assignment["from_date"]),
 				None,
 			)
-			row["effective_until"] = add_days(successor, -1) if successor else None
+			assignment["effective_until"] = add_days(successor, -1) if successor else None
 		else:
-			row["is_current"] = False
-			row["effective_until"] = None
+			assignment["is_scheduled"] = False
+			assignment["is_current"] = False
+			assignment["effective_until"] = None
 
-	return rows
+	return assignments
 
 
-# -- Change a component -------------------------------------------------------
+# -- Changing allocations -----------------------------------------------------
 
 
 @frappe.whitelist()
-def change_component_values(
+def change_allocations(
 	employee: str,
 	effective_from: str,
 	changes,
 	notes: str | None = None,
 	source_assignment: str | None = None,
 ) -> dict:
-	"""Create the next Salary Structure Assignment with new component values.
+	"""Create the next Salary Structure Assignment with new component amounts.
 
-	:param changes: ``{ssa_fieldname: amount}``. May arrive as a JSON string
-		from the client.
+	:param changes: ``{salary_component: amount}``. May arrive as a JSON string.
 	:param source_assignment: the assignment the caller was looking at. Checked
-		against the one actually in force so the caller cannot diff against a
+		against the one actually in force, so the caller cannot diff against a
 		superseded row without noticing.
-
-	Returns the new assignment's name and a per-component before/after diff.
 	"""
 	frappe.has_permission("Salary Structure Assignment", "create", throw=True)
 
@@ -203,18 +371,14 @@ def change_component_values(
 		frappe.throw(_("No component changes were supplied."))
 
 	effective_from = getdate(effective_from)
-
-	requested = {}
-	for fieldname, value in changes.items():
-		_validate_allocation_field(fieldname)
-		requested[fieldname] = flt(value)
+	requested = {cstr(component): flt(amount) for component, amount in changes.items()}
 
 	source_name = _assignment_on(employee, effective_from)
 	if not source_name:
 		frappe.throw(
 			_(
 				"{0} has no submitted Salary Structure Assignment on or before {1}. "
-				"Create the first assignment manually, then change components from there."
+				"Create the first assignment manually, then change allocations from there."
 			).format(
 				frappe.bold(employee),
 				frappe.bold(frappe.format(effective_from, {"fieldtype": "Date"})),
@@ -226,7 +390,7 @@ def change_component_values(
 		frappe.throw(
 			_(
 				"You are viewing assignment {0}, but {1} is the one in force on {2}. "
-				"Open {1} and change the component there."
+				"Open {1} and change the allocation there."
 			).format(
 				frappe.bold(source_assignment),
 				frappe.bold(source_name),
@@ -238,24 +402,42 @@ def change_component_values(
 	_guard_chain(employee, effective_from)
 
 	previous = frappe.get_doc("Salary Structure Assignment", source_name)
+	current = {row.salary_component: flt(row.amount) for row in previous.get(ALLOCATION_FIELD) or []}
 
-	diff = {}
-	for fieldname, value in requested.items():
-		before = flt(previous.get(fieldname))
-		if before != value:
-			diff[fieldname] = {"before": before, "after": value}
+	unknown = sorted(set(requested) - set(current))
+	if unknown:
+		if not current:
+			frappe.throw(
+				_(
+					"Assignment {0} has no component allocation yet -- it predates this feature. "
+					"Open it, save it once so the grid fills from {1}, then change the amounts."
+				).format(frappe.bold(source_name), frappe.bold(previous.salary_structure)),
+				title=_("Allocation Not Set Up"),
+			)
+		frappe.throw(
+			_("{0} is not allocated on assignment {1}. Add it to Salary Structure {2} first.").format(
+				frappe.bold(", ".join(unknown)),
+				frappe.bold(source_name),
+				frappe.bold(previous.salary_structure),
+			),
+			title=_("Unknown Component"),
+		)
 
+	diff = {
+		component: {"before": current[component], "after": amount}
+		for component, amount in requested.items()
+		if current[component] != amount
+	}
 	if not diff:
 		frappe.throw(
-			_("The supplied values already match assignment {0}. Nothing to change.").format(
+			_("The supplied amounts already match assignment {0}. Nothing to change.").format(
 				frappe.bold(source_name)
 			)
 		)
 
-	# copy_doc carries every field and child row forward (payroll_payable_account,
-	# income_tax_slab, currency, payroll cost centres, the untouched components),
-	# which matters: a Payroll Entry filters employees on payroll_payable_account,
-	# so an assignment created without it is silently dropped from the run.
+	# copy_doc carries every field and child row forward -- the allocation grid,
+	# income_tax_slab, currency, payroll cost centres, and payroll_payable_account,
+	# without which a Payroll Entry silently drops the employee from the run.
 	#
 	# ignore_no_copy=False clears no_copy fields. On this DocType that is
 	# amended_from alone, which must not follow a copy into a fresh document.
@@ -266,13 +448,20 @@ def change_component_values(
 	# skip the draft-then-submit path entirely. Set it explicitly.
 	assignment.docstatus = 0
 
-	for fieldname in _TAX_OPENING_FIELDS:
+	# Mid-year tax openings belong to the assignment that opened the payroll
+	# period. get_opening_for() only ignores them while
+	# from_date < payroll_period.start_date, so carrying them onto an assignment
+	# dated inside the current period would re-arm a stale opening on every
+	# remaining slip -- and warn_about_missing_opening_entries stays silent,
+	# because it only fires when the fields are empty.
+	for fieldname in ("taxable_earnings_till_date", "tax_deducted_till_date"):
 		if assignment.meta.has_field(fieldname):
 			assignment.set(fieldname, 0)
 
 	assignment.from_date = effective_from
-	for fieldname, value in requested.items():
-		assignment.set(fieldname, value)
+	for row in assignment.get(ALLOCATION_FIELD) or []:
+		if row.salary_component in requested:
+			row.amount = requested[row.salary_component]
 
 	assignment.insert()
 	assignment.submit()
@@ -299,10 +488,10 @@ def _assignment_on(employee: str, on_date) -> str | None:
 
 
 def _guard_chain(employee: str, effective_from) -> None:
-	"""Refuse changes that would corrupt the assignment chain.
+	"""Refuse changes that would be meaningless or ambiguous.
 
-	Two cases: an assignment already starts on that exact date (core raises a
-	bare DuplicateAssignment here -- this says what to do instead), or a later
+	Either an assignment already starts on that exact date (core raises a bare
+	DuplicateAssignment here -- this says what to do instead), or a later
 	assignment already exists, in which case inserting behind it would leave the
 	newer one still in force and the change would appear to do nothing.
 	"""
@@ -379,13 +568,11 @@ def _warn_about_paid_periods(employee: str, effective_from) -> dict | None:
 
 
 def _build_change_comment(previous_name: str, diff: dict, notes: str | None) -> str:
-	meta = frappe.get_meta("Salary Structure Assignment")
 	lines = [_("Carried forward from {0}.").format(previous_name)]
-	for fieldname, change in diff.items():
-		field = meta.get_field(fieldname)
+	for component, change in diff.items():
 		lines.append(
 			"{}: {} -> {}".format(
-				_(field.label or fieldname) if field else fieldname,
+				component,
 				frappe.format(change["before"], {"fieldtype": "Currency"}),
 				frappe.format(change["after"], {"fieldtype": "Currency"}),
 			)
@@ -395,37 +582,136 @@ def _build_change_comment(previous_name: str, diff: dict, notes: str | None) -> 
 	return "<br>".join(lines)
 
 
-# -- Document events ----------------------------------------------------------
+# -- Adoption on an existing site ---------------------------------------------
 
 
-def set_total_salary(doc, method=None) -> None:
-	"""Keep the read-only total in step with the components it sums.
+def _assignments_missing_allocations(salary_structure: str) -> list[str]:
+	"""Submitted assignments for this structure that carry no allocation rows.
 
-	Registered on Salary Structure Assignment ``validate`` so a manually created
-	first assignment is covered too, not only assignments this module builds.
+	``validate`` never runs on a submitted document, so an assignment created
+	before this app was installed cannot grow its grid by being re-saved. It has
+	to be backfilled.
 	"""
-	if not doc.meta.has_field(TOTAL_FIELD):
-		return
-
-	doc.set(
-		TOTAL_FIELD,
-		sum(flt(doc.get(fieldname)) for fieldname in ALLOCATION_FIELDS if doc.meta.has_field(fieldname)),
+	assignments = frappe.get_all(
+		"Salary Structure Assignment",
+		filters={"salary_structure": salary_structure, "docstatus": 1},
+		pluck="name",
 	)
+	if not assignments:
+		return []
+
+	allocated = set(
+		frappe.get_all(
+			"TSI Salary Allocation",
+			filters={"parent": ["in", assignments], "parenttype": "Salary Structure Assignment"},
+			pluck="parent",
+			distinct=True,
+		)
+	)
+	return [name for name in assignments if name not in allocated]
+
+
+@frappe.whitelist()
+def backfill_allocations(salary_structure: str, dry_run: int = 1) -> dict:
+	"""Add the allocation grid to assignments that were submitted before this app.
+
+	Rows are created at **amount 0**, deliberately. The real per-employee figures
+	are not knowable from the old assignment, and inventing them would pay the
+	wrong salary silently. Set the real amounts afterwards with **Change
+	Allocation**, which dates a fresh assignment -- then wire the structure.
+
+	Idempotent, and ``dry_run`` by default.
+	"""
+	frappe.only_for(("System Manager", "HR Manager"))
+
+	dry_run = bool(int(dry_run or 0))
+	components = _structure_components(salary_structure)
+	if not components:
+		frappe.throw(
+			_("Salary Structure {0} defines no allocatable components.").format(frappe.bold(salary_structure))
+		)
+
+	assignments = frappe.get_all(
+		"Salary Structure Assignment",
+		filters={"salary_structure": salary_structure, "docstatus": 1},
+		fields=["name", "employee"],
+		order_by="from_date asc",
+	)
+
+	planned = []
+	for assignment in assignments:
+		present = set(
+			frappe.get_all(
+				"TSI Salary Allocation",
+				filters={"parent": assignment.name, "parenttype": "Salary Structure Assignment"},
+				pluck="salary_component",
+			)
+		)
+		missing = [c for c in components if c["salary_component"] not in present]
+		if not missing:
+			continue
+
+		planned.append(
+			{
+				"assignment": assignment.name,
+				"employee": assignment.employee,
+				"adds": [c["salary_component"] for c in missing],
+			}
+		)
+
+		if dry_run:
+			continue
+
+		for offset, component in enumerate(missing, start=len(present) + 1):
+			row = frappe.new_doc("TSI Salary Allocation")
+			row.update(
+				{
+					"parent": assignment.name,
+					"parenttype": "Salary Structure Assignment",
+					"parentfield": ALLOCATION_FIELD,
+					"idx": offset,
+					"salary_component": component["salary_component"],
+					"abbr": component["abbr"],
+					"component_type": component["component_type"],
+					"formula_variable": component["formula_variable"],
+					"amount": 0,
+				}
+			)
+			# Match the parent, which is submitted.
+			row.docstatus = 1
+			row.insert(ignore_permissions=True)
+
+		frappe.clear_document_cache("Salary Structure Assignment", assignment.name)
+
+	return {
+		"salary_structure": salary_structure,
+		"dry_run": dry_run,
+		"planned": planned,
+		"assignments_touched": len(planned),
+	}
 
 
 # -- Salary Structure wiring (admin helper) -----------------------------------
 
 
 @frappe.whitelist()
-def wire_salary_structure_formulas(salary_structure: str, mapping=None, dry_run: int = 1) -> dict:
-	"""Point a Salary Structure's earning rows at the SSA component fields.
+def wire_salary_structure_formulas(salary_structure: str, dry_run: int = 1) -> dict:
+	"""Point every Salary Structure row at its own allocation variable.
 
-	Without this the component fields are written but never read: a Salary
-	Detail row only picks up an SSA field if it is formula-based and the formula
-	names that field.
+	Without this the amounts are stored on the assignment and never read: a
+	Salary Detail row only picks up a value if it is formula-based and its
+	formula names the variable.
 
 	Idempotent, and ``dry_run`` by default -- inspect ``planned`` before running
 	with ``dry_run=0``.
+
+	Rows whose formula is exactly ``base`` are left alone. That is core's own
+	field, still used elsewhere in hrms, and a site that already drives Basic
+	from it should keep doing so.
+
+	Income tax, flexible benefit and statistical rows (:data:`UNMANAGED_FLAGS`)
+	are left alone too, and reported as ``left_unmanaged``. hrms computes those
+	itself -- giving an income-tax row a formula stops it being treated as tax.
 
 	Rows are written with ``frappe.db.set_value`` rather than ``doc.save()``:
 	``formula`` and ``condition`` are ``allow_on_submit`` on Salary Detail but
@@ -436,34 +722,60 @@ def wire_salary_structure_formulas(salary_structure: str, mapping=None, dry_run:
 	frappe.only_for(("System Manager", "HR Manager"))
 
 	dry_run = bool(int(dry_run or 0))
-	if isinstance(mapping, str):
-		mapping = frappe.parse_json(mapping)
-	mapping = mapping or DEFAULT_COMPONENT_MAP
 
-	for fieldname in set(mapping.values()):
-		_validate_allocation_field(fieldname)
+	# Wiring switches the structure over to reading the grid. Any submitted
+	# assignment without one would then hit a NameError on its next slip, and a
+	# submitted document cannot grow the grid by being re-saved -- validate does
+	# not run. Refuse until they are backfilled.
+	unallocated = _assignments_missing_allocations(salary_structure)
+	if unallocated:
+		frappe.throw(
+			_(
+				"{0} submitted assignment(s) for {1} have no component allocation, "
+				"starting with {2}. Payroll would fail for them once the structure is wired. "
+				"Run backfill_allocations for this structure first, then set the real amounts "
+				"with Change Allocation."
+			).format(
+				frappe.bold(len(unallocated)),
+				frappe.bold(salary_structure),
+				frappe.bold(unallocated[0]),
+			),
+			title=_("Assignments Not Allocated Yet"),
+		)
 
 	rows = frappe.get_all(
 		"Salary Detail",
-		filters={
-			"parent": salary_structure,
-			"parenttype": "Salary Structure",
-			"parentfield": "earnings",
-		},
-		fields=["name", "salary_component", "amount", "amount_based_on_formula", "formula"],
-		order_by="idx asc",
+		filters={"parent": salary_structure, "parenttype": "Salary Structure"},
+		fields=[
+			"name",
+			"salary_component",
+			"abbr",
+			"parentfield",
+			"amount",
+			"amount_based_on_formula",
+			"formula",
+			*UNMANAGED_FLAGS,
+		],
+		order_by="parentfield desc, idx asc",
 	)
 	if not rows:
-		frappe.throw(_("Salary Structure {0} has no earning rows.").format(frappe.bold(salary_structure)))
+		frappe.throw(_("Salary Structure {0} has no component rows.").format(frappe.bold(salary_structure)))
 
-	planned, already_wired, unmapped = [], [], []
+	planned, already_wired, left_on_base, left_unmanaged = [], [], [], []
 	for row in rows:
-		fieldname = mapping.get(row.salary_component)
-		if not fieldname:
-			unmapped.append(row.salary_component)
+		if _is_unmanaged(row):
+			# Income tax, flexible benefits and statistical components are hrms'
+			# own to compute -- wiring them would silently switch that off.
+			left_unmanaged.append(row.salary_component)
 			continue
 
-		if row.amount_based_on_formula and cstr(row.formula).strip() == fieldname:
+		existing = cstr(row.formula).strip()
+		if existing == "base":
+			left_on_base.append(row.salary_component)
+			continue
+
+		variable = formula_variable(_resolve_abbr(row), row.salary_component)
+		if row.amount_based_on_formula and existing == variable:
 			already_wired.append(row.salary_component)
 			continue
 
@@ -471,8 +783,9 @@ def wire_salary_structure_formulas(salary_structure: str, mapping=None, dry_run:
 			{
 				"row": row.name,
 				"salary_component": row.salary_component,
-				"formula": fieldname,
-				"previous_formula": cstr(row.formula).strip(),
+				"component_type": "Earning" if row.parentfield == "earnings" else "Deduction",
+				"formula": variable,
+				"previous_formula": existing,
 				# A leftover fixed amount alongside a formula row is the classic
 				# double-pay trap, so report it whether or not it gets cleared.
 				"clears_amount": flt(row.amount),
@@ -484,11 +797,7 @@ def wire_salary_structure_formulas(salary_structure: str, mapping=None, dry_run:
 			frappe.db.set_value(
 				"Salary Detail",
 				item["row"],
-				{
-					"amount_based_on_formula": 1,
-					"formula": item["formula"],
-					"amount": 0,
-				},
+				{"amount_based_on_formula": 1, "formula": item["formula"], "amount": 0},
 				update_modified=False,
 			)
 		frappe.clear_document_cache("Salary Structure", salary_structure)
@@ -498,5 +807,6 @@ def wire_salary_structure_formulas(salary_structure: str, mapping=None, dry_run:
 		"dry_run": dry_run,
 		"planned": planned,
 		"already_wired": already_wired,
-		"unmapped_components": unmapped,
+		"left_on_base": left_on_base,
+		"left_unmanaged": left_unmanaged,
 	}

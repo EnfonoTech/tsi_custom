@@ -147,10 +147,22 @@ doctype_list_js = {
 
 doc_events = {
 	"Salary Structure Assignment": {
-		# Keeps the read-only Total Salary in step with the components it sums,
-		# including on assignments created by hand rather than by this app.
-		"validate": "tsi_custom.salary_allocation.set_total_salary",
+		# sync_allocations fills the grid from the selected Salary Structure and
+		# refreshes each row's formula variable; set_total_salary then sums the
+		# Earning rows. Both run on hand-made assignments too, not only on the
+		# ones this app generates.
+		"validate": [
+			"tsi_custom.salary_allocation.sync_allocations",
+			"tsi_custom.salary_allocation.set_total_salary",
+		],
 	},
+}
+
+# Salary Slip is extended only to publish the allocation amounts into the salary
+# formula namespace -- see tsi_custom/overrides/salary_slip.py for why this
+# cannot be a doc_event. Note: only one app can override a given DocType class.
+override_doctype_class = {
+	"Salary Slip": "tsi_custom.overrides.salary_slip.TSISalarySlip",
 }
 
 # Scheduled Tasks

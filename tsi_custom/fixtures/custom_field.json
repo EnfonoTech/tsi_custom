@@ -13,54 +13,17 @@
  },
  {
   "doctype": "Custom Field",
-  "name": "Salary Structure Assignment-custom_tsi_hra_amount",
+  "name": "Salary Structure Assignment-custom_tsi_allocations",
   "dt": "Salary Structure Assignment",
-  "fieldname": "custom_tsi_hra_amount",
-  "fieldtype": "Currency",
-  "label": "HRA / Living Allowances",
-  "options": "currency",
+  "fieldname": "custom_tsi_allocations",
+  "fieldtype": "Table",
+  "label": "Component Allocation",
+  "options": "TSI Salary Allocation",
   "insert_after": "custom_tsi_allocation_section",
   "module": "TSI",
-  "non_negative": 1,
-  "description": "Monthly allocation. Change it with the pencil button, which dates a new assignment.",
+  "depends_on": "salary_structure",
+  "description": "Filled from the selected Salary Structure. Each row's Formula Variable is what the structure's formula must reference.",
   "idx": 2
- },
- {
-  "doctype": "Custom Field",
-  "name": "Salary Structure Assignment-custom_tsi_transport_amount",
-  "dt": "Salary Structure Assignment",
-  "fieldname": "custom_tsi_transport_amount",
-  "fieldtype": "Currency",
-  "label": "Transport / Food Allowance",
-  "options": "currency",
-  "insert_after": "custom_tsi_hra_amount",
-  "module": "TSI",
-  "non_negative": 1,
-  "idx": 3
- },
- {
-  "doctype": "Custom Field",
-  "name": "Salary Structure Assignment-custom_tsi_allocation_column_break",
-  "dt": "Salary Structure Assignment",
-  "fieldname": "custom_tsi_allocation_column_break",
-  "fieldtype": "Column Break",
-  "label": "",
-  "insert_after": "custom_tsi_transport_amount",
-  "module": "TSI",
-  "idx": 4
- },
- {
-  "doctype": "Custom Field",
-  "name": "Salary Structure Assignment-custom_tsi_other_allowance_amount",
-  "dt": "Salary Structure Assignment",
-  "fieldname": "custom_tsi_other_allowance_amount",
-  "fieldtype": "Currency",
-  "label": "Other Allowance",
-  "options": "currency",
-  "insert_after": "custom_tsi_allocation_column_break",
-  "module": "TSI",
-  "non_negative": 1,
-  "idx": 5
  },
  {
   "doctype": "Custom Field",
@@ -70,11 +33,12 @@
   "fieldtype": "Currency",
   "label": "Total Salary",
   "options": "currency",
-  "insert_after": "custom_tsi_other_allowance_amount",
+  "insert_after": "custom_tsi_allocations",
   "module": "TSI",
   "read_only": 1,
   "bold": 1,
-  "description": "Base + HRA + Transport + Other. The contracted monthly allocation, not the paid gross - a Salary Slip prorates and rounds each component independently.",
-  "idx": 6
+  "depends_on": "salary_structure",
+  "description": "Sum of the Earning rows. The contracted monthly allocation, not the paid gross - a Salary Slip prorates and rounds each component independently.",
+  "idx": 3
  }
 ]
