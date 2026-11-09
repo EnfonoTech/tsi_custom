@@ -1,0 +1,147 @@
+{#- TSI Salary Slip: earnings on the left; attendance, leave and deductions on the right; net pay summary below.
+    Two-column layout uses a table, not flexbox, because wkhtmltopdf renders flexbox unreliably. -#}
+{#- Plain numbers, currency code in the headers: the OMR symbol is right-to-left and flips next to digits. -#}
+{%- macro money(v) -%}{{ frappe.utils.fmt_money(v, precision=doc.precision("net_pay")) }}{%- endmacro -%}
+{%- set earnings = doc.earnings | rejectattr("statistical_component") | list -%}
+{%- set deductions = doc.deductions | rejectattr("statistical_component") | list -%}
+{%- set full_salary = earnings | sum(attribute="default_amount") -%}
+{%- set unpaid_adjustment = full_salary - doc.gross_pay -%}
+{%- set leave_taken = get_leave_taken(doc) -%}
+
+<style>
+	.tsi-slip { font-size: 11px; color: #222; }
+	.tsi-slip table { width: 100%; border-collapse: collapse; }
+	.tsi-slip h2 { font-size: 16px; margin: 0 0 2px; }
+	.tsi-slip .muted { color: #666; }
+	.tsi-slip .right { text-align: right; }
+	.tsi-slip .info td { padding: 3px 6px; border: 1px solid #ddd; }
+	.tsi-slip .info td.tsi-lbl { background: #f5f5f5; width: 18%; font-weight: 600; }
+	.tsi-slip .cols > tbody > tr > td { width: 50%; vertical-align: top; padding: 0; }
+	.tsi-slip .cols > tbody > tr > td.gap { width: 2%; }
+	.tsi-slip .box { margin-bottom: 10px; }
+	.tsi-slip .box th { background: #2f4f6f; color: #fff; padding: 4px 6px; text-align: left; font-weight: 600; }
+	.tsi-slip .box td { padding: 3px 6px; border-bottom: 1px solid #e5e5e5; }
+	.tsi-slip .box tr.total td { font-weight: 700; border-top: 1px solid #999; border-bottom: none; background: #f5f5f5; }
+	.tsi-slip .summary td { padding: 4px 8px; border: 1px solid #ddd; }
+	.tsi-slip .summary tr.net td { font-size: 13px; font-weight: 700; background: #eaf1f7; }
+	.tsi-slip .note { font-size: 9.5px; color: #666; margin-top: 6px; }
+</style>
+
+<div class="tsi-slip">
+	{% if letter_head and not no_letterhead %}
+	<div>{{ letter_head }}</div>
+	{% endif %}
+
+	<table style="margin-bottom: 8px;">
+		<tr>
+			<td>
+				<h2>{{ _("Payslip") }}</h2>
+				<div class="muted">{{ doc.company }}</div>
+			</td>
+			<td class="right">
+				<h2>{{ frappe.utils.formatdate(doc.end_date, "MMMM yyyy") }}</h2>
+				<div class="muted">{{ _("Pay period") }}: {{ doc.get_formatted("start_date") }} - {{ doc.get_formatted("end_date") }}</div>
+			</td>
+		</tr>
+	</table>
+
+	<table class="info" style="margin-bottom: 10px;">
+		<tr>
+			<td class="tsi-lbl">{{ _("Employee") }}</td><td>{{ doc.employee_name }}</td>
+			<td class="tsi-lbl">{{ _("Employee ID") }}</td><td>{{ doc.employee }}</td>
+		</tr>
+		<tr>
+			<td class="tsi-lbl">{{ _("Designation") }}</td><td>{{ doc.designation or "" }}</td>
+			<td class="tsi-lbl">{{ _("Department") }}</td><td>{{ doc.department or "" }}</td>
+		</tr>
+		<tr>
+			<td class="tsi-lbl">{{ _("Bank") }}</td><td>{{ doc.bank_name or "" }}</td>
+			<td class="tsi-lbl">{{ _("Account No.") }}</td><td>{{ doc.bank_account_no or "" }}</td>
+		</tr>
+	</table>
+
+	<table class="cols">
+		<tr>
+			{#- LEFT: salary breakdown -#}
+			<td>
+				<table class="box">
+					<tr>
+						<th style="width: 46%;">{{ _("Earnings") }}</th>
+						<th class="right">{{ _("Full Month") }} ({{ doc.currency }})</th>
+						<th class="right">{{ _("This Month") }} ({{ doc.currency }})</th>
+					</tr>
+					{% for row in earnings %}
+					<tr>
+						<td>{{ _(row.salary_component) }}</td>
+						<td class="right">{{ money(row.default_amount) }}</td>
+						<td class="right">{{ money(row.amount) }}</td>
+					</tr>
+					{% endfor %}
+					<tr class="total">
+						<td>{{ _("Gross Earnings") }}</td>
+						<td class="right">{{ money(full_salary) }}</td>
+						<td class="right">{{ money(doc.gross_pay) }}</td>
+					</tr>
+				</table>
+			</td>
+
+			<td class="gap"></td>
+
+			{#- RIGHT: attendance, leave, deductions -#}
+			<td>
+				<table class="box">
+					<tr><th colspan="2">{{ _("Attendance") }}</th></tr>
+					<tr><td>{{ _("Working Days in Period") }}</td><td class="right">{{ doc.total_working_days | float | round(1) }}</td></tr>
+					<tr><td>{{ _("Absent Days") }}</td><td class="right">{{ (doc.absent_days or 0) | float | round(1) }}</td></tr>
+					<tr><td>{{ _("Unpaid Leave Days") }}</td><td class="right">{{ (doc.leave_without_pay or 0) | float | round(1) }}</td></tr>
+					<tr class="total"><td>{{ _("Paid Days") }}</td><td class="right">{{ doc.payment_days | float | round(1) }}</td></tr>
+				</table>
+
+				<table class="box">
+					<tr><th>{{ _("Leave Taken") }}</th><th class="right">{{ _("Days") }}</th></tr>
+					{% for row in leave_taken %}
+					<tr>
+						<td>{{ _(row.leave_type) }}{% if row.pay_note %} <span class="muted">({{ row.pay_note }})</span>{% endif %}</td>
+						<td class="right">{{ row.days | float | round(1) }}</td>
+					</tr>
+					{% else %}
+					<tr><td colspan="2" class="muted">{{ _("No leave taken in this period") }}</td></tr>
+					{% endfor %}
+				</table>
+
+				<table class="box">
+					<tr><th>{{ _("Deductions") }}</th><th class="right">{{ _("Amount") }} ({{ doc.currency }})</th></tr>
+					{% for row in deductions %}
+					<tr>
+						<td>{{ _(row.salary_component) }}</td>
+						<td class="right">{{ money(row.amount) }}</td>
+					</tr>
+					{% else %}
+					<tr><td colspan="2" class="muted">{{ _("No deductions") }}</td></tr>
+					{% endfor %}
+					<tr class="total">
+						<td>{{ _("Total Deductions") }}</td>
+						<td class="right">{{ money(doc.total_deduction) }}</td>
+					</tr>
+				</table>
+			</td>
+		</tr>
+	</table>
+
+	{#- How net pay is reached -#}
+	<table class="summary">
+		<tr><td>{{ _("Full Month Salary") }}</td><td class="right">{{ money(full_salary) }}</td></tr>
+		{% if unpaid_adjustment > 0.005 %}
+		<tr><td>{{ _("Less: Adjustment for unpaid / absent days") }}</td><td class="right">- {{ money(unpaid_adjustment) }}</td></tr>
+		{% endif %}
+		<tr><td>{{ _("Gross Earnings") }}</td><td class="right">{{ money(doc.gross_pay) }}</td></tr>
+		<tr><td>{{ _("Less: Total Deductions") }}</td><td class="right">- {{ money(doc.total_deduction) }}</td></tr>
+		<tr class="net"><td>{{ _("Net Salary") }} ({{ doc.currency }})</td><td class="right">{{ money(doc.rounded_total or doc.net_pay) }}</td></tr>
+		<tr><td colspan="2" class="muted">{{ doc.total_in_words or "" }}</td></tr>
+	</table>
+
+	<div class="note">
+		{{ _("Earnings that depend on attendance are paid as Full Month amount x Paid Days / Working Days in Period.") }}
+		{{ _("Partly paid leave reduces Paid Days by its unpaid share: one day of leave at 75% pay counts as 0.25 unpaid day.") }}
+	</div>
+</div>

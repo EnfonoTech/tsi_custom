@@ -82,16 +82,16 @@ doctype_list_js = {
 # ----------
 
 # add methods and filters to jinja environment
-# jinja = {
-# 	"methods": "tsi_custom.utils.jinja_methods",
-# 	"filters": "tsi_custom.utils.jinja_filters"
-# }
+# get_leave_taken feeds the leave table on the TSI Salary Slip print format
+jinja = {
+	"methods": ["tsi_custom.payslip.get_leave_taken"],
+}
 
 # Installation
 # ------------
 
 # before_install = "tsi_custom.install.before_install"
-# after_install = "tsi_custom.install.after_install"
+after_install = "tsi_custom.oman_leave.create_oman_leave_types"
 
 # Uninstallation
 # ------------
